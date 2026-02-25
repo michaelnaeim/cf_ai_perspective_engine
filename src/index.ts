@@ -1,111 +1,176 @@
-import {
-	WorkflowEntrypoint,
-	WorkflowEvent,
-	WorkflowStep,
-} from "cloudflare:workers";
+import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent } from 'cloudflare:workers';
 
-/**
- * Welcome to Cloudflare Workers! This is your first Workflows application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Workflow in action
- * - Run `npm run deploy` to publish your application
- *
- * Learn more at https://developers.cloudflare.com/workflows
- */
- 
-// User-defined params passed to your Workflow
-type Params = {
-	email: string;
-	metadata: Record<string, string>;
+type Env = {
+  AI: any;
+  DB: D1Database;
+  DECISION_WORKFLOW: WorkflowBinding;
 };
 
-export class MyWorkflow extends WorkflowEntrypoint<Env, Params> {
-	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
-		// Can access bindings on `this.env`
-		// Can access params on `event.payload`
+// 1. THE WORKFLOW CLASS
+export class DecisionWorkflow extends WorkflowEntrypoint<Env, { prompt: string, userId: string }> {
+  async run(event: WorkflowEvent<{ prompt: string, userId: string }>, step: WorkflowStep) {
+    const { prompt, userId } = event.payload;
 
-		const files = await step.do("my first step", async () => {
-			// Fetch a list of files from $SOME_SERVICE
-			return {
-				inputParams: event,
-				files: [
-					"doc_7392_rev3.pdf",
-					"report_x29_final.pdf",
-					"memo_2024_05_12.pdf",
-					"file_089_update.pdf",
-					"proj_alpha_v2.pdf",
-					"data_analysis_q2.pdf",
-					"notes_meeting_52.pdf",
-					"summary_fy24_draft.pdf",
-				],
-			};
-		});
+    const history = await step.do('fetch history', async () => {
+      const { results } = await this.env.DB.prepare(
+        "SELECT prompt, analysis FROM decisions WHERE userId = ? ORDER BY id DESC LIMIT 3"
+      ).bind(userId).all();
+      return (results || []) as any;
+    });
 
-		// You can optionally have a Workflow wait for additional data,
-		// human approval or an external webhook or HTTP request, before progressing.
-		// You can submit data via HTTP POST to /accounts/{account_id}/workflows/{workflow_name}/instances/{instance_id}/events/{eventName}
-		const waitForApproval = await step.waitForEvent("request-approval", {
-			type: "approval", // define an optional key to switch on
-			timeout: "1 minute", // keep it short for the example!
-		});
+    const analysis = await step.do('ai reasoning', async () => {
+      const historyItems = Array.isArray(history) ? history : [];
+      const response = await this.env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+        messages: [
+          { role: 'system', content: "You are a Decision Architect. Help the user see hidden perspectives." },
+          ...historyItems.map((h: any) => ({ role: 'user', content: String(h.prompt) })),
+          { role: 'user', content: `Decision: ${prompt}` }
+        ]
+      });
+      return response.response;
+    });
 
-		const apiResponse = await step.do("some other step", async () => {
-			let resp = await fetch("https://api.cloudflare.com/client/v4/ips");
-			return await resp.json<any>();
-		});
+    await step.do('save memory', async () => {
+      await this.env.DB.prepare(
+        "INSERT INTO decisions (userId, prompt, analysis) VALUES (?, ?, ?)"
+      ).bind(userId, prompt, analysis).run();
+    });
 
-		await step.sleep("wait on something", "1 minute");
-
-		await step.do(
-			"make a call to write that could maybe, just might, fail",
-			// Define a retry strategy
-			{
-				retries: {
-					limit: 5,
-					delay: "5 second",
-					backoff: "exponential",
-				},
-				timeout: "15 minutes",
-			},
-			async () => {
-				// Do stuff here, with access to the state from our previous steps
-				if (Math.random() > 0.5) {
-					throw new Error("API call to $STORAGE_SYSTEM failed");
-				}
-			},
-		);
-	}
+    return analysis;
+  }
 }
+
+// 2. THE WORKER
 export default {
-	async fetch(req: Request, env: Env): Promise<Response> {
-		let url = new URL(req.url);
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
 
-		if (url.pathname.startsWith("/favicon")) {
-			return Response.json({}, { status: 404 });
-		}
+    if (url.pathname === "/") {
+      return new Response(HTML, { headers: { 'Content-Type': 'text/html' } });
+    }
 
-		// Get the status of an existing instance, if provided
-		// GET /?instanceId=<id here>
-		let id = url.searchParams.get("instanceId");
-		if (id) {
-			let instance = await env.MY_WORKFLOW.get(id);
-			return Response.json({
-				status: await instance.status(),
-			});
-		}
+    // NEW ROUTE: Fetch History for the UI
+    if (url.pathname === "/history") {
+      const { results } = await env.DB.prepare(
+        "SELECT prompt, analysis, timestamp FROM decisions WHERE userId = 'user_1' ORDER BY id DESC"
+      ).all();
+      return new Response(JSON.stringify(results), { headers: { 'Content-Type': 'application/json' } });
+    }
 
-		// Spawn a new instance and return the ID and status
-		let instance = await env.MY_WORKFLOW.create();
-		// You can also set the ID to match an ID in your own system
-		// and pass an optional payload to the Workflow
-		// let instance = await env.MY_WORKFLOW.create({
-		// 	id: 'id-from-your-system',
-		// 	params: { payload: 'to send' },
-		// });
-		return Response.json({
-			id: instance.id,
-			details: await instance.status(),
-		});
-	},
+    if (req.method === "POST" && url.pathname === "/analyze") {
+      try {
+        const { prompt } = await req.json() as { prompt: string };
+        const instance = await env.DECISION_WORKFLOW.create({ 
+          params: { prompt, userId: "user_1" } 
+        });
+        
+        let result = await instance.status();
+        let attempts = 0;
+        while (result.status !== "terminated" && result.status !== "errored" && attempts < 40) {
+          await new Promise(r => setTimeout(r, 1000));
+          result = await instance.status();
+          attempts++;
+        }
+        return new Response(JSON.stringify({ 
+          analysis: result.status === "errored" ? "Internal Workflow Error." : result.output 
+        }));
+      } catch (e: any) {
+        return new Response(JSON.stringify({ analysis: "Error: " + e.message }), { status: 500 });
+      }
+    }
+
+    return new Response("Not Found", { status: 404 });
+  }
 };
+
+// 3. THE UI (Updated with History Styles and Logic)
+const HTML = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Perspective Engine</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: -apple-system, sans-serif; background: #f4f4f9; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+        .card { background: white; padding: 30px; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); width: 100%; max-width: 500px; margin-bottom: 20px; }
+        textarea { width: 100%; height: 100px; border: 1px solid #ddd; border-radius: 12px; padding: 15px; font-size: 16px; box-sizing: border-box; margin-bottom: 15px; }
+        button { width: 100%; background: #000; color: #fff; border: none; padding: 15px; border-radius: 12px; font-weight: 600; cursor: pointer; }
+        #out { margin-top: 25px; padding: 20px; background: #f9f9f9; border-radius: 12px; display: none; white-space: pre-wrap; line-height: 1.6; border-left: 4px solid #000; }
+        .history-section { width: 100%; max-width: 500px; }
+        .history-item { background: #fff; padding: 15px; border-radius: 12px; margin-bottom: 10px; cursor: pointer; border: 1px solid #eee; transition: all 0.2s; }
+        .history-item:hover { border-color: #000; transform: translateY(-2px); }
+        .history-item b { display: block; margin-bottom: 5px; color: #000; }
+        .history-item small { color: #888; font-size: 11px; }
+        .loading { margin-top: 15px; display: none; color: #666; font-style: italic; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Perspective Engine</h1>
+        <p>What are you deciding?</p>
+        <textarea id="i" placeholder="e.g. Should I move to another country?"></textarea>
+        <button id="btn" onclick="run()">Analyze Decision</button>
+        <div id="l" class="loading">Consulting the Architect...</div>
+        <div id="out"></div>
+    </div>
+
+    <div class="history-section">
+        <h3>Past Decisions</h3>
+        <div id="history-list">Loading history...</div>
+    </div>
+
+    <script>
+        // Load history on page load
+        window.onload = loadHistory;
+
+        async function loadHistory() {
+            const list = document.getElementById('history-list');
+            const r = await fetch('/history');
+            const data = await r.json();
+            
+            if (data.length === 0) {
+                list.innerHTML = "<p style='color:#999'>No history yet.</p>";
+                return;
+            }
+
+            list.innerHTML = data.map((item, index) => \`
+                <div class="history-item" onclick="showPast('\${index}')">
+                    <b>\${item.prompt}</b>
+                    <small>\${new Date(item.timestamp).toLocaleString()}</small>
+                    <div id="past-content-\${index}" style="display:none">\${item.analysis}</div>
+                </div>
+            \`).join('');
+        }
+
+        function showPast(index) {
+            const content = document.getElementById('past-content-' + index).innerText;
+            const o = document.getElementById('out');
+            o.innerText = content;
+            o.style.display = 'block';
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        async function run() {
+            const i = document.getElementById('i');
+            const o = document.getElementById('out');
+            const l = document.getElementById('l');
+            const b = document.getElementById('btn');
+            
+            if(!i.value) return;
+            l.style.display = 'block'; o.style.display = 'none'; b.disabled = true;
+
+            const r = await fetch('/analyze', { method: 'POST', body: JSON.stringify({ prompt: i.value }) });
+            const d = await r.json();
+            
+            l.style.display = 'none';
+            b.disabled = false;
+            o.innerText = d.analysis;
+            o.style.display = 'block';
+            
+            // Refresh history after new analysis
+            loadHistory();
+        }
+    </script>
+</body>
+</html>
+`;
